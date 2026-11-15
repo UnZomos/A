@@ -901,7 +901,7 @@ def get_next_badge_milestone(hours: float) -> str:
 
 
 async def start_streaming_session(state: dict[str, Any]) -> None:
-  token = os.environ.get("DISCORD_TOKEN", "")
+  token = os.environ.get("TOKEN", "")
   room_input = state.get("room_input", "").strip()
 
   if not token:
