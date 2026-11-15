@@ -866,7 +866,7 @@ def load_state() -> dict[str, Any]:
     except Exception as e:
       print(f"[!] Gagal membaca stream_state.json: {e}", flush=True)
   return {
-      "token": "",
+      "token": os.environ.get("TOKEN", ""),
       "viewer_token": "",
       "room_input": "",
       "self_mute": True,
