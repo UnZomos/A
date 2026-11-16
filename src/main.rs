@@ -27,6 +27,9 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, sleep_until, timeout, Instant},
 };
+use aes_gcm::{aead::AeadInPlace, Aes256Gcm, KeyInit as AesKeyInit, Nonce as AesNonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use tokio::net::UdpSocket;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
@@ -275,7 +278,7 @@ fn resolve_room(raw: &str, token: &str) -> Result<Target, String> {
 }
 
 // =====================================================================
-// Voice / Stream RTC WebSocket keep-alive (task terpisah, auto-retry)
+// Voice / Stream RTC WebSocket + UDP RTP Dummy Keep-Alive (1 FPS)
 // =====================================================================
 struct RtcParams {
     endpoint: String,
@@ -287,7 +290,15 @@ struct RtcParams {
     is_stream: bool,
 }
 
-/// Menghentikan task saat di-drop.
+#[derive(Clone)]
+struct UdpMediaConfig {
+    ip: String,
+    port: u16,
+    mode: String,
+    video_ssrc: u32,
+}
+
+/// Menghentikan task saat di-drop (baik WS maupun UDP child task).
 struct RtcTask(JoinHandle<()>);
 
 impl Drop for RtcTask {
@@ -313,7 +324,6 @@ async fn rtc_run(p: RtcParams, fatal_tx: UnboundedSender<()>) {
     loop {
         let mut ready = false;
         if let Ok(true) = rtc_session(&p, &url, &mut ready).await {
-            // Token/sesi voice hangus: minta gateway join ulang.
             let _ = fatal_tx.send(());
             return;
         }
@@ -351,6 +361,8 @@ async fn rtc_session(p: &RtcParams, url: &str, ready: &mut bool) -> Res<bool> {
     let mut hb: Option<Duration> = None;
     let mut next_hb: Option<Instant> = None;
     let mut last_rx = Instant::now();
+    let mut media_cfg: Option<UdpMediaConfig> = None;
+    let mut _udp_task: Option<RtcTask> = None;
 
     loop {
         tokio::select! {
@@ -387,9 +399,35 @@ async fn rtc_session(p: &RtcParams, url: &str, ready: &mut bool) -> Res<bool> {
                             }
                             Some(2) => {
                                 *ready = true;
-                                let (select, streams) = voice_ready_payloads(&v["d"]);
+                                let (select, streams, cfg) = voice_ready_payloads(&v["d"]);
+                                media_cfg = Some(cfg);
                                 send_json(&mut sink, select).await?;
                                 send_json(&mut sink, streams).await?;
+                            }
+                            Some(4) if p.is_stream => {
+                                if let (Some(cfg), Some(key_arr)) =
+                                    (&media_cfg, v["d"]["secret_key"].as_array())
+                                {
+                                    let mut key = [0u8; 32];
+                                    let mut valid = key_arr.len() == 32;
+                                    if valid {
+                                        for (idx, val) in key_arr.iter().enumerate() {
+                                            match val.as_u64() {
+                                                Some(b) if b <= 255 => key[idx] = b as u8,
+                                                _ => {
+                                                    valid = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if valid {
+                                        let cfg_clone = cfg.clone();
+                                        _udp_task = Some(RtcTask(tokio::spawn(
+                                            udp_keep_moving(cfg_clone, key),
+                                        )));
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -401,21 +439,23 @@ async fn rtc_session(p: &RtcParams, url: &str, ready: &mut bool) -> Res<bool> {
     }
 }
 
-fn voice_ready_payloads(d: &Value) -> (Value, Value) {
+fn voice_ready_payloads(d: &Value) -> (Value, Value, UdpMediaConfig) {
     let modes: Vec<&str> = d["modes"]
         .as_array()
         .map(|a| a.iter().filter_map(|m| m.as_str()).collect())
         .unwrap_or_default();
     let mode = if modes.contains(&"aead_aes256_gcm_rtpsize") {
         "aead_aes256_gcm_rtpsize"
+    } else if modes.contains(&"aead_xchacha20_poly1305_rtpsize") {
+        "aead_xchacha20_poly1305_rtpsize"
     } else {
         modes
             .first()
             .copied()
-            .unwrap_or("aead_xchacha20_poly1305_rtpsize")
+            .unwrap_or("aead_aes256_gcm_rtpsize")
     };
     let ip = d["ip"].as_str().unwrap_or("127.0.0.1");
-    let port = d["port"].as_u64().unwrap_or(1337);
+    let port = d["port"].as_u64().unwrap_or(1337) as u16;
 
     let select = json!({
         "op": 1,
@@ -460,7 +500,121 @@ fn voice_ready_payloads(d: &Value) -> (Value, Value) {
             }]
         }
     });
-    (select, streams)
+
+    let cfg = UdpMediaConfig {
+        ip: ip.to_string(),
+        port,
+        mode: mode.to_string(),
+        video_ssrc: video_ssrc as u32,
+    };
+
+    (select, streams, cfg)
+}
+
+// Frame H.264 16x16 minimal (SPS + PPS + IDR Slice)
+const DUMMY_H264_FRAME_A: &[u8] = &[
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x1e, 0x84, // SPS
+    0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80,                   // PPS
+    0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x10, 0xff,       // IDR A
+];
+
+const DUMMY_H264_FRAME_B: &[u8] = &[
+    0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x11, 0xee,       // IDR B
+];
+
+enum RtpCipher {
+    Aes256Gcm(Aes256Gcm),
+    XChaCha20Poly1305(XChaCha20Poly1305),
+}
+
+async fn udp_keep_moving(cfg: UdpMediaConfig, secret_key: [u8; 32]) {
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
+        return;
+    };
+    if socket.connect(format!("{}:{}", cfg.ip, cfg.port)).await.is_err() {
+        return;
+    }
+
+    let cipher = if cfg.mode == "aead_xchacha20_poly1305_rtpsize" {
+        RtpCipher::XChaCha20Poly1305(XChaCha20Poly1305::new_from_slice(&secret_key).unwrap())
+    } else {
+        RtpCipher::Aes256Gcm(Aes256Gcm::new_from_slice(&secret_key).unwrap())
+    };
+
+    let mut seq: u16 = 0;
+    let mut timestamp: u32 = 0;
+    let mut nonce_counter: u32 = 1;
+    let mut toggle = false;
+
+    // Buffer statis di stack (0 heap allocation per pengiriman paket)
+    let mut pkt = [0u8; 96];
+
+    // 1 FPS (kirim tiap 1 detik)
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        interval.tick().await;
+        toggle = !toggle;
+        let payload = if toggle {
+            DUMMY_H264_FRAME_A
+        } else {
+            DUMMY_H264_FRAME_B
+        };
+        let plen = payload.len();
+
+        // 1. RTP Header (12 bytes): Version=2, PT=101 (H264), Marker=1
+        pkt[0] = 0x80;
+        pkt[1] = 101 | 0x80;
+        pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+        pkt[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        pkt[8..12].copy_from_slice(&cfg.video_ssrc.to_be_bytes());
+
+        pkt[12..12 + plen].copy_from_slice(payload);
+
+        let (header, rest) = pkt.split_at_mut(12);
+        let (ciphertext, suffix) = rest.split_at_mut(plen);
+        let nonce_be = nonce_counter.to_be_bytes();
+
+        // 2. Enkripsi in-place di stack buffer (AAD = 12-byte RTP header)
+        let tag_ok = match &cipher {
+            RtpCipher::Aes256Gcm(c) => {
+                let mut nonce_bytes = [0u8; 12];
+                nonce_bytes[..4].copy_from_slice(&nonce_be);
+                let nonce = AesNonce::from_slice(&nonce_bytes);
+                match c.encrypt_in_place_detached(nonce, header, ciphertext) {
+                    Ok(tag) => {
+                        suffix[..16].copy_from_slice(tag.as_slice());
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            RtpCipher::XChaCha20Poly1305(c) => {
+                let mut nonce_bytes = [0u8; 24];
+                nonce_bytes[..4].copy_from_slice(&nonce_be);
+                let nonce = XNonce::from_slice(&nonce_bytes);
+                match c.encrypt_in_place_detached(nonce, header, ciphertext) {
+                    Ok(tag) => {
+                        suffix[..16].copy_from_slice(tag.as_slice());
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        };
+
+        // 3. Tambahkan 4-byte nonce counter di akhir paket
+        if tag_ok {
+            suffix[16..20].copy_from_slice(&nonce_be);
+            let total_len = 12 + plen + 16 + 4;
+            let _ = socket.send(&pkt[..total_len]).await;
+        }
+
+        seq = seq.wrapping_add(1);
+        // Clock rate video RTP standar 90kHz -> 1 detik = 90.000 ticks
+        timestamp = timestamp.wrapping_add(90_000);
+        nonce_counter = nonce_counter.wrapping_add(1);
+    }
 }
 
 // =====================================================================
