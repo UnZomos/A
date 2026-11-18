@@ -1,73 +1,53 @@
-# stream-keepalive
+# Stream Keepalive
 
-Program Rust ringan yang menjaga sesi streaming tetap hidup (*keepalive*) dengan pemakaian RAM dan jaringan seminimal mungkin. Dirancang untuk berjalan terus-menerus di server kecil atau platform cloud seperti Railway.
+A lightweight Rust application designed to maintain an active streaming session 24/7 with minimal CPU, memory, and bandwidth consumption. Built with asynchronous networking to run continuously on low-resource VPS instances or container platforms like Railway.
 
-> **Branch:** `rust`
+---
 
-## Fitur
+## Key Features
 
-- Koneksi WebSocket persisten dengan TLS (`tokio-tungstenite` + `rustls`)
-- Runtime async yang hemat resource (`tokio`)
-- Menyimpan status sesi ke `stream_state.json`, jadi total durasi streaming tetap terlacak setelah restart
-- Shutdown rapi lewat sinyal (Ctrl+C / SIGTERM)
-- Binary dioptimalkan untuk ukuran kecil (`opt-level = "s"`, LTO, `strip`)
-- Siap deploy dengan Docker
+- **Asynchronous Architecture**: Powered by `tokio` for low memory usage and non-blocking I/O.
+- **WebSocket & RTC Keep-Alive**: Connects directly to gateway and voice RTC sessions with compressed payloads (`zlib-stream`).
+- **Minimal Video RTP Simulation**: Generates lightweight dummy H.264 frames at 1 FPS over encrypted UDP (supporting `aead_aes256_gcm_rtpsize` and `aead_xchacha20_poly1305_rtpsize`) to keep the stream state alive without encoding overhead.
+- **State Persistence**: Records accumulated stream duration to `stream_state.json` so milestones remain intact across restarts.
+- **Milestone Tracking**: Monitors progress against streaming badge tiers in real time.
+- **Graceful Shutdown**: Intercepts `SIGINT` (Ctrl+C) and `SIGTERM` signals to leave voice channels cleanly before exiting.
 
-## Struktur proyek
+---
 
-```
+## Project Structure
+
+```text
 .
-├── src/                 # Kode sumber Rust
-├── Cargo.toml           # Dependensi dan profil build
-├── Dockerfile           # Build image untuk deploy
-└── stream_state.json    # Status sesi (dibuat/diperbarui otomatis)
+├── src/
+│   ├── main.rs          # Core application logic, gateway, and RTC handlers
+│   └── util.rs          # Channel parser, badge tiers, and helper utilities
+├── Cargo.toml           # Package configuration and dependencies
+├── Dockerfile           # Minimal container build specification
+├── LICENSE              # Open-source license
+└── stream_state.json    # Local session state and accumulated duration
 ```
 
-## Persyaratan
+---
 
-- Rust (stable terbaru, edisi 2021) dan Cargo
-- atau Docker, kalau mau menjalankan lewat container
+## Configuration
 
-## Menjalankan
+The application is configured through environment variables and a local JSON state file.
 
-### Lokal
+### Environment Variables
 
-```bash
-git clone -b rust https://github.com/UnZomos/A.git
-cd A
-cargo run --release
-```
-
-Binary hasil build ada di `target/release/stream-keepalive`.
-
-### Docker
-
-```bash
-docker build -t stream-keepalive .
-docker run --rm stream-keepalive
-```
-
-### Railway
-
-Dockerfile memakai image `rust:1-slim` karena Rust bawaan Railway (1.84) terlalu lama untuk beberapa crate. Cukup hubungkan repo (branch `rust`) dan Railway akan build otomatis dari `Dockerfile`.
-
-## Konfigurasi
-
-<!-- TODO: isi dengan environment variable yang dipakai di src/ -->
-
-| Variabel | Wajib | Keterangan |
-| -------- | ----- | ---------- |
-| _(isi)_  | _(ya/tidak)_ | _(isi)_ |
-
-> Jangan commit token, kredensial, atau rahasia lain ke repositori. Simpan di environment variable atau secret manager platform deploy.
+| Variable | Required | Description |
+|---|---|---|
+| `TOKEN` | **Yes** | User authentication token. Never commit this to source control. |
+| `ROOM_INPUT` | Optional | Target channel ID, URL, or pair. Falls back to `stream_state.json` if omitted. |
 
 ### `stream_state.json`
 
-File status sesi dengan format:
+This file is created and updated automatically. You can also preconfigure initial values:
 
 ```json
 {
-  "room_input": "<id-room>",
+  "room_input": "1563278810256769116",
   "self_mute": true,
   "self_deaf": true,
   "self_video": false,
@@ -75,32 +55,47 @@ File status sesi dengan format:
 }
 ```
 
-| Field | Arti |
-| ----- | ---- |
-| `room_input` | ID room tujuan |
-| `self_mute` | Mikrofon dimatikan |
-| `self_deaf` | Audio masuk dimatikan |
-| `self_video` | Video dinyalakan atau tidak |
-| `total_streamed_seconds` | Akumulasi durasi streaming (detik) |
+- `room_input`: Channel identifier or Discord link (`https://discord.com/channels/...`).
+- `self_mute` / `self_deaf`: Mute and deafen flags when joining voice.
+- `self_video`: Video feed state indicator.
+- `total_streamed_seconds`: Stored stream duration counter in seconds.
 
-## Dependensi utama
+---
 
-| Crate | Fungsi |
-| ----- | ------ |
-| `tokio` | Runtime async, timer, jaringan, sinyal |
-| `tokio-tungstenite` | Klien WebSocket (TLS via rustls) |
-| `rustls` | TLS tanpa OpenSSL |
-| `ureq` | Klien HTTP sederhana |
-| `flate2` | Kompresi/dekompresi |
-| `serde`, `serde_json` | Serialisasi status dan pesan JSON |
-| `base64`, `rand`, `uuid` | Utilitas encoding dan ID acak |
+## Getting Started
 
-## Rencana pengembangan
+### Prerequisites
 
-- [ ] Menambah frame/gambar ringan agar sesi tampak seperti streaming sungguhan, dengan batas RAM dan jaringan yang rendah
-- [ ] Merapikan struktur file di repositori
-- [ ] Melengkapi dokumentasi konfigurasi
+- Rust toolchain (stable edition 2021) and Cargo, or Docker.
 
-## Lisensi
+### Running Locally
 
-<!-- TODO: tambahkan lisensi (mis. MIT) -->
+```bash
+# Clone the repository
+git clone -b rust https://github.com/UnZomos/A.git
+cd A
+
+# Set configuration and run
+export TOKEN="your_token_here"
+export ROOM_INPUT="your_channel_id_or_url"
+cargo run --release
+```
+
+The optimized binary will be compiled to `target/release/stream-keepalive`.
+
+### Running with Docker
+
+```bash
+docker build -t stream-keepalive .
+docker run -d \
+  -e TOKEN="your_token_here" \
+  -e ROOM_INPUT="your_channel_id_or_url" \
+  --name stream-keepalive \
+  stream-keepalive
+```
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
